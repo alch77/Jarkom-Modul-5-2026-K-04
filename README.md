@@ -22,7 +22,7 @@ Tokyo-3, 2015. SEELE menyusup ke jaringan NERV lewat Dummy System dan menanam pe
 
 Berikut adalah desain topologi jaringan dan diagram pohon VLSM (*Subnet Tree*) yang digunakan dalam simulasi ini:
 
-![Topologi Jaringan](assets/topologi.png)
+![Topologi Jaringan](assets/s1_topologi.png)
 *Gambar 1.1: Desain Topologi Jaringan GNS3 NERV Tokyo-3 (Operation Geofront)*
 
 ![Pohon VLSM](out/tree.png)
