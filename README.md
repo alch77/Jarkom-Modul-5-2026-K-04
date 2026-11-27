@@ -839,3 +839,386 @@ Alamat sumber diterjemahkan **di Gendou**, bukan Misato: rule `POSTROUTING` `MAS
 
 ![Counter MASQUERADE pada Gendou](assets/s10_nat-counter-gendou.png)  
 *Gambar 10.5: Counter pada rule `MASQUERADE` Gendou menunjukkan paket dari prefix internal keluar melalui `eth0`.*
+
+---
+
+## Bagian 4 — Firewall dengan `iptables`
+
+### Soal 11: Casper yang Menjadi Hantu
+
+#### Konsep dan Konfigurasi
+
+Agar **Magi-Casper** (`192.213.4.58`) tidak menjawab ping dari host mana pun tetapi tetap bisa melakukan ping ke host lain, kita cukup memblokir paket **ICMP Echo Request** (`--icmp-type echo-request` / tipe 8) yang masuk pada chain `INPUT`, tanpa memblokir paket **ICMP Echo Reply** (`--icmp-type echo-reply` / tipe 0) maupun trafik keluar pada chain `OUTPUT`.
+
+Konfigurasi disimpan pada `/root/casper-soal11.sh` (salinan repo: [`casper-soal11.sh`](out/route-scripts/casper-soal11.sh)):
+
+```bash
+#!/bin/sh
+iptables -F INPUT
+iptables -P INPUT ACCEPT
+iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+```
+
+#### Verifikasi
+
+1. **Ping dari Magi-Balthasar (`192.213.4.59`) dan Lilith (`192.213.4.74`) ke Magi-Casper (`192.213.4.58`):** keduanya gagal (`100% packet loss`) karena paket `echo-request` dijatuhkan di chain `INPUT` Casper.
+2. **Ping dari Magi-Casper ke Magi-Balthasar dan Lilith:** keduanya berhasil (`0% packet loss`) karena paket `echo-request` keluar melalui `OUTPUT` dan balasannya berupa `echo-reply` yang tidak diblokir di `INPUT`.
+
+![Verifikasi Soal 11 pada Magi-Casper](assets/s11_casper-hantu.png)  
+*Gambar 11.1: Magi-Balthasar dan Lilith gagal ping Magi-Casper (100% packet loss), sedangkan Magi-Casper berhasil ping kedua host tersebut (0% packet loss).*
+
+---
+
+### Soal 12: Casper yang Terkunci Sendiri
+
+#### Analisis Kerusakan `break_fw.sh`
+
+Ketika `break_fw.sh` dijalankan di **Magi-Casper** (`192.213.4.58`), skrip tersebut mengubah policy `INPUT` menjadi `DROP` dan hanya mengizinkan paket `icmp echo-request`:
+
+```bash
+iptables -F
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+```
+
+Akibatnya:
+1. **Default policy `INPUT DROP` tanpa stateful rule (`ESTABLISHED,RELATED`):** saat Magi-Casper mencoba mengakses internet (`apt-get update` atau `ping 8.8.8.8`), paket keluar memang diizinkan oleh `OUTPUT ACCEPT`, tetapi seluruh paket balasan dari luar (DNS reply, HTTP response, maupun ICMP `echo-reply`) langsung dibuang oleh chain `INPUT`.
+2. **Tidak ada pengecualian untuk loopback (`-i lo`) dan port layanan (`tcp --dport 5000`):** komunikasi internal proses lokal terputus dan klien seperti **Unit-00** (`192.213.4.68`) tidak dapat terhubung ke layanan TCP port `5000` di Magi-Casper.
+3. **Aturan Soal 11 terbalik:** `icmp echo-request` justru di-`ACCEPT`, padahal seharusnya `DROP`.
+
+#### Perbaikan
+
+Tanpa mengubah default policy `INPUT` kembali ke `ACCEPT` (tetap mempertahankan prinsip *default-deny* `iptables -P INPUT DROP`), kita menyusun ulang chain `INPUT` pada `/root/casper.sh` (salinan repo: [`casper.sh`](out/route-scripts/casper.sh)):
+
+```bash
+#!/bin/sh
+iptables -F
+iptables -X
+
+# Pertahankan default policy INPUT DROP sesuai instruksi soal
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+
+# 1. Izinkan trafik loopback lokal
+iptables -A INPUT -i lo -j ACCEPT
+
+# 2. Pertahankan ketentuan Soal 11: tolak ping masuk (echo-request)
+iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+
+# 3. Izinkan paket balasan dari koneksi yang diinisiasi Casper sendiri
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# 4. Izinkan akses masuk ke layanan TCP port 5000
+iptables -A INPUT -p tcp --dport 5000 -j ACCEPT
+```
+
+#### Verifikasi
+
+- **Unit-00 (`192.213.4.68`) mengakses layanan TCP 5000 di Magi-Casper:** `nc -z -v -w 3 192.213.4.58 5000` berhasil (`192.213.4.58 (192.213.4.58:5000) open`, `exit=0`).
+- **Magi-Casper mengakses repositori/internet:** `apt-get update` dan `ping -c 2 8.8.8.8` berhasil karena paket balasan cocok dengan rule `ESTABLISHED,RELATED`.
+- **Ketentuan Soal 11 tetap aktif:** policy `INPUT` tetap `DROP` dan `icmp echo-request` masuk tetap di-`DROP`.
+
+![Verifikasi perbaikan firewall Magi-Casper pada Soal 12](assets/s12_casper-hardening.png)  
+*Gambar 12.1: Setelah perbaikan `/root/casper.sh` dengan policy `INPUT DROP`, Unit-00 berhasil mengakses port 5000 Magi-Casper dan Magi-Casper dapat menjalankan `apt-get update`.*
+
+---
+
+### Soal 13: Balthasar yang Tegas
+
+#### Konsep dan Konfigurasi
+
+**Magi-Balthasar** (`192.213.4.59`) menjalankan dua layanan TCP pada port `5000` dan `5001`. Hanya **Magi-Casper** (`192.213.4.58`) dan seluruh **Pilot** — yaitu **Unit-01** (`192.213.4.66`), **Unit-02** (`192.213.4.67`), **Unit-00** (`192.213.4.68`), serta **Sachiel** (`192.213.3.130`) — yang diizinkan mengakses kedua port tersebut.
+
+Agar pihak lain yang mencoba mengakses port `5000` atau `5001` **langsung ditolak saat itu juga tanpa menunggu timeout**, kita menggunakan target `REJECT --reject-with tcp-reset` (mengirim paket TCP `RST`) alih-alih `DROP`.
+
+Konfigurasi disimpan di `/root/balthasar.sh` (salinan repo: [`balthasar.sh`](out/route-scripts/balthasar.sh)):
+
+```bash
+#!/bin/sh
+iptables -F INPUT
+iptables -P INPUT ACCEPT
+
+# Izinkan loopback dan koneksi yang sudah terbentuk
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Izinkan Magi-Casper
+iptables -A INPUT -p tcp -s 192.213.4.58 -m multiport --dports 5000,5001 -j ACCEPT
+
+# Izinkan seluruh Pilot (Switch-Cage: Unit-01, Unit-02, Unit-00 & Switch-Bunker: Sachiel)
+iptables -A INPUT -p tcp -s 192.213.4.66 -m multiport --dports 5000,5001 -j ACCEPT
+iptables -A INPUT -p tcp -s 192.213.4.67 -m multiport --dports 5000,5001 -j ACCEPT
+iptables -A INPUT -p tcp -s 192.213.4.68 -m multiport --dports 5000,5001 -j ACCEPT
+iptables -A INPUT -p tcp -s 192.213.3.130 -m multiport --dports 5000,5001 -j ACCEPT
+
+# Tolak pihak lain seketika dengan TCP RST
+iptables -A INPUT -p tcp -m multiport --dports 5000,5001 -j REJECT --reject-with tcp-reset
+```
+
+#### Verifikasi
+
+- **Dari Unit-01 (`192.213.4.66`):** koneksi `nc -z -v -w 3 192.213.4.59 5000` dan port `5001` berhasil (`open`, `exit=0`).
+- **Dari Lilith (`192.213.4.74`) dan Magi-Melchior (`192.213.4.60`):** koneksi `nc` ke `192.213.4.59:5000` dan `5001` langsung menghasilkan `Connection refused` (`exit=1`) dalam waktu `0.003s–0.005s` tanpa tertahan hingga batas timeout 3 detik.
+
+![Verifikasi akses port 5000 dan 5001 pada Magi-Balthasar](assets/s13_brankas-balthasar.png)  
+*Gambar 13.1: Unit-01 diizinkan mengakses port 5000 dan 5001 Magi-Balthasar, sedangkan Lilith dan Magi-Melchior langsung ditolak seketika (`Connection refused` dalam ~0.004 detik).*
+
+---
+
+### Soal 14: Jam Besuk Pen-Pen
+
+#### Pemetaan Kelompok dan Konversi Waktu (WIB ke UTC)
+
+**Pen-Pen** (`192.213.3.195` pada Switch-Medic `192.213.3.192/27`) membatasi akses masuk ke layanan TCP port `80` berdasarkan kelompok pengirim dan jadwal waktu. Karena modul `iptables -m time` secara default mengevaluasi waktu dalam **UTC**, sedangkan jadwal soal menggunakan **WIB (UTC+7)**, seluruh rentang jam dikonversi dengan mengurangi 7 jam:
+
+| Kelompok | Daftar Host / Subnet | Jadwal WIB | Jadwal UTC (`iptables -m time`) | Hari |
+|---|---|---|---|---|
+| **Pilot** | Unit-01 (`.4.66`), Unit-02 (`.4.67`), Unit-00 (`.4.68`), Sachiel (`.3.130`) | 08:00 – 16:00 WIB | `01:00` – `09:00` UTC | `Mon,Tue,Wed,Thu,Fri` |
+| **Staf** | Lilith (`.4.74`), Adam (`.4.75`), Zeruel (`.4.82`), Armisael (`.4.83`), Dock-Crew (`.0.2`), Hangar-Crew (`.1.2`), Quarters (`.2.2`), Garden-Staff (`.3.2`) | 17:00 – 23:00 WIB | `10:00` – `16:00` UTC | Setiap hari |
+| **Dummy System** | Entry-Plug (`192.213.4.50`), Dummy-Plug (`192.213.4.51`) — `192.213.4.48/29` | Dilarang setiap saat | Selalu `DROP` | Setiap saat |
+
+Agar mudah diuji oleh asisten saat demo tanpa mengubah struktur rule satu per satu, variabel rentang jam ditaruh di bagian paling atas `/root/pen-pen.sh` (salinan repo: [`pen-pen.sh`](out/route-scripts/pen-pen.sh)):
+
+```bash
+#!/bin/sh
+# Variabel jam dalam UTC (WIB = UTC+7)
+# Default Pilot: 08:00-16:00 WIB -> 01:00-09:00 UTC (Senin-Jumat)
+# Default Staf : 17:00-23:00 WIB -> 10:00-16:00 UTC (Setiap hari)
+PILOT_START="${PILOT_START:-01:00}"
+PILOT_STOP="${PILOT_STOP:-09:00}"
+PILOT_DAYS="${PILOT_DAYS:-Mon,Tue,Wed,Thu,Fri}"
+
+STAF_START="${STAF_START:-10:00}"
+STAF_STOP="${STAF_STOP:-16:00}"
+
+iptables -F INPUT
+iptables -P INPUT ACCEPT
+
+# 1. Dummy System (Switch-Lab: Entry-Plug & Dummy-Plug) selalu dilarang ke port 80
+iptables -A INPUT -p tcp --dport 80 -s 192.213.4.48/29 -j DROP
+
+# 2. Kelompok Pilot hanya boleh saat jam besuk Pilot
+for ip in 192.213.4.66 192.213.4.67 192.213.4.68 192.213.3.130; do
+    iptables -A INPUT -p tcp --dport 80 -s "$ip" -m time --timestart "$PILOT_START" --timestop "$PILOT_STOP" --weekdays "$PILOT_DAYS" --utc -j ACCEPT
+done
+
+# 3. Kelompok Staf hanya boleh saat jam besuk Staf
+for ip in 192.213.4.74 192.213.4.75 192.213.4.82 192.213.4.83 192.213.0.2 192.213.1.2 192.213.2.2 192.213.3.2; do
+    iptables -A INPUT -p tcp --dport 80 -s "$ip" -m time --timestart "$STAF_START" --timestop "$STAF_STOP" --utc -j ACCEPT
+done
+
+# 4. Selain yang memenuhi jadwal di atas, akses ke port 80 ditolak
+iptables -A INPUT -p tcp --dport 80 -j DROP
+```
+
+#### Verifikasi
+
+1. **Saat variabel waktu diatur cocok dengan jam sistem saat pengujian (`00:00–23:59` UTC):**
+   - **Unit-01 (Pilot)** dan **Lilith (Staf)** berhasil mengakses `http://192.213.3.195:80` (`Welcome to Pen-Pen`, `exit=0`).
+   - **Dummy-Plug (Dummy System)** dan **Spy (di luar daftar Pilot/Staf)** tetap ditolak (`exit=1`).
+2. **Saat variabel waktu diatur di luar jam sistem (`23:58–23:59` UTC) maupun dikembalikan ke jadwal resmi:** akses di luar jam besuk otomatis tertahan oleh rule `DROP` terakhir.
+
+![Verifikasi pembatasan waktu akses port 80 pada Pen-Pen](assets/s14_jadwal-penpen.png)  
+*Gambar 14.1: Pengujian skrip `pen-pen.sh` saat jadwal cocok dan tidak cocok untuk Unit-01 (Pilot), Lilith (Staf), serta blokir permanen untuk Dummy System dan Spy.*
+
+---
+
+### Soal 15: Rem Darurat untuk Ping
+
+#### Konsep dan Konfigurasi
+
+Untuk melindungi **Tokyo3-Core** (`192.213.4.106`) dari banjir ping tanpa mematikan ping normal, kita menggunakan modul `limit` pada chain `INPUT` yang mengizinkan `icmp --icmp-type echo-request` maksimal `5/second` (dengan `--limit-burst 5`), diikuti segera oleh rule `DROP` untuk membuang paket `echo-request` yang melampaui kuota tersebut.
+
+Konfigurasi pada `/root/tokyo3-core.sh` (salinan repo: [`tokyo3-core.sh`](out/route-scripts/tokyo3-core.sh)):
+
+```bash
+# Soal 15: Rate limit ICMP echo-request maksimal 5 paket/detik
+iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/second --limit-burst 5 -j ACCEPT
+iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+```
+
+#### Verifikasi
+
+- **Ping beruntun cepat (`ping -i 0.1 -c 50 192.213.4.106` dari Magi-Casper, 10 paket/detik):** hanya sebagian paket (~29 dari 50 paket) yang dijawab, sedangkan sisanya (~42% packet loss) dibuang oleh rule `DROP` kedua (terlihat dari counter paket `DROP` yang bertambah).
+- **Ping santai (`ping -i 3 -c 4 192.213.4.106`, 1 paket tiap 3 detik):** seluruh paket berhasil dijawab (`4 received, 0% packet loss`).
+
+![Verifikasi rate-limit ICMP pada Tokyo3-Core](assets/s15_banjir-ping-tokyo3.png)  
+*Gambar 15.1: Ping cepat (`-i 0.1 -c 50`) ke Tokyo3-Core mengalami pemangkasan paket sesuai batas 5/detik, sedangkan ping santai (`-i 3 -c 4`) berhasil 0% packet loss.*
+
+---
+
+### Soal 16: Alarm Percobaan Penyusupan
+
+#### Konsep dan Konfigurasi
+
+**Tokyo3-Core** (`192.213.4.106`) melayani web publik pada port `80` dan `8080`, tetapi sering dipindai dari arah **Switch-Lab** — khususnya **Dummy-Plug** (`192.213.4.51`) — pada port sensitif `22` (SSH), `23` (Telnet), dan `3306` (MySQL).
+
+Agar setiap percobaan koneksi ke ketiga port tersebut **tercatat terlebih dahulu di log kernel** dengan penanda `"SCAN-NERV: "` lalu **ditolak seketika**, kita memasang dua rule berurutan pada chain `INPUT` di `/root/tokyo3-core.sh`:
+1. Rule pertama bertarget `LOG --log-prefix "SCAN-NERV: "` (target `LOG` bersifat *non-terminating*, sehingga paket lanjut ke rule berikutnya setelah dicatat).
+2. Rule kedua bertarget `REJECT --reject-with tcp-reset` agar pemindai langsung menerima penolakan tanpa menggantung.
+
+```bash
+# Soal 16: Catat dan tolak percobaan akses port 22, 23, 3306 dari Dummy-Plug (192.213.4.51)
+iptables -A INPUT -s 192.213.4.51 -p tcp -m multiport --dports 22,23,3306 -j LOG --log-prefix "SCAN-NERV: " --log-level 4
+iptables -A INPUT -s 192.213.4.51 -p tcp -m multiport --dports 22,23,3306 -j REJECT --reject-with tcp-reset
+```
+
+#### Verifikasi
+
+Dari **Dummy-Plug** (`192.213.4.51`):
+- Percobaan akses ke port `22`, `23`, dan `3306` pada `192.213.4.106` langsung ditolak (`exit=1`) dan menaikkan penghitung paket pada rule `LOG` (`prefix "SCAN-NERV: "`) serta rule `REJECT`.
+- Akses ke layanan web resmi pada port `80` (`Welcome to Tokyo3-Core`) dan port `8080` (`syifa imutz`) tetap berjalan normal tanpa gangguan.
+
+![Verifikasi deteksi dan penolakan port scanning pada Tokyo3-Core](assets/s16_scan-nerv-tokyo3.png)  
+*Gambar 16.1: Percobaan koneksi Dummy-Plug ke port 22, 23, dan 3306 tercatat pada rule `LOG` berprefiks `SCAN-NERV: ` dan langsung ditolak, sementara port 80 dan 8080 tetap dapat diakses.*
+
+---
+
+### Soal 17: Belokan Diam-Diam di Fuyutsuki
+
+#### Konsep dan Konfigurasi
+
+**Fuyutsuki** adalah router yang berada di jalur antara **Magi-Casper** (`192.213.4.58` di Switch-Terminal `192.213.4.56/29`, terhubung ke `eth1` Fuyutsuki) dan jaringan lainnya. Untuk membelokkan secara transparan setiap koneksi TCP dari **Magi-Casper** (`192.213.4.58`) yang ditujukan ke **Zeruel** (`192.213.4.82`) agar justru mendarat di **Pen-Pen** (`192.213.3.195`), kita menambahkan rule `DNAT` pada chain `PREROUTING` tabel `nat` di **Fuyutsuki** (`/root/fuyutsuki-route.sh`, salinan repo: [`fuyutsuki-route.sh`](out/route-scripts/fuyutsuki-route.sh)):
+
+```bash
+iptables -t nat -F PREROUTING
+iptables -t nat -A PREROUTING -s 192.213.4.58 -d 192.213.4.82 -p tcp -j DNAT --to-destination 192.213.3.195
+```
+
+Ketika paket TCP dari `192.213.4.58` menuju `192.213.4.82:9000` tiba di Fuyutsuki:
+1. Sebelum keputusan routing dibuat (`PREROUTING`), alamat tujuan diubah menjadi `192.213.3.195:9000`.
+2. Fuyutsuki meneruskan paket tersebut melalui Maya (`192.213.4.154`) menuju **Pen-Pen** (`192.213.3.195`), bukan ke Gendou/Shigeru menuju Zeruel.
+3. Tabel `conntrack` di Fuyutsuki mencatat sesi DNAT tersebut dan otomatis mengubah alamat sumber paket balasan dari `192.213.3.195` kembali menjadi `192.213.4.82`, sehingga Magi-Casper tidak menyadari bahwa ia sedang berbicara dengan Pen-Pen.
+
+#### Verifikasi
+
+1. Jalankan listener TCP port `9000` di **Pen-Pen** (`192.213.3.195`) dan **Zeruel** (`192.213.4.82`).
+2. Kirim pesan `rahasia-casper-untuk-zeruel` dari **Magi-Casper** ke `192.213.4.82` port `9000`.
+3. Pesan diterima di log listener **Pen-Pen**, sedangkan log listener **Zeruel** tetap kosong. Output `conntrack -L | grep 9000` di Fuyutsuki memperlihatkan pasangan tuple asli (`src=192.213.4.58 dst=192.213.4.82`) dan tuple balasan dari Pen-Pen (`src=192.213.3.195 dst=192.213.4.58`).
+
+![Verifikasi pembelokan trafik DNAT di Fuyutsuki](assets/s17_dnat-fuyutsuki.png)  
+*Gambar 17.1: Pesan TCP port 9000 dari Magi-Casper ke Zeruel (`192.213.4.82`) mendarat di Pen-Pen (`192.213.3.195`) melalui rule `DNAT PREROUTING` dan tercatat di `conntrack` Fuyutsuki.*
+
+---
+
+### Soal 18: Gerbang Satu Arah Shigeru
+
+#### Konsep dan Konfigurasi
+
+**Shigeru** menghubungkan **Gendou** (`eth0` `192.213.4.158/30`), **Switch-Monolith** (`eth1` `192.213.4.81/29`, tempat Zeruel & Armisael berada), dan **Makoto** (`eth2` `192.213.4.161/30`, jalur menuju Switch-Radar).
+
+Ketentuan gerbang satu arah pada chain `FORWARD` **Shigeru**:
+1. Host di dalam wilayah Shigeru (Switch-Monolith `192.213.4.80/29` dan Switch-Radar `192.213.4.112/29`) bebas menginisiasi koneksi keluar menuju jaringan luar, dan paket balasannya diizinkan kembali masuk (`-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT`).
+2. Dari arah luar (masuk melalui `eth0` dari sisi Gendou), **hanya** paket **ICMP Echo Request** yang berasal dari subnet **Switch-Terminal** (`192.213.4.56/29`: Magi-Casper, Magi-Balthasar, Magi-Melchior) yang boleh masuk melewati Shigeru.
+3. Seluruh koneksi baru lainnya dari arah luar (`-i eth0`) menuju wilayah Shigeru diblokir (`DROP`).
+
+Konfigurasi pada `/root/shigeru-route.sh` (salinan repo: [`shigeru-route.sh`](out/route-scripts/shigeru-route.sh)):
+
+```bash
+iptables -F FORWARD
+iptables -P FORWARD ACCEPT
+
+# 1. Izinkan paket balasan untuk koneksi yang sudah terbentuk (termasuk inisiasi dari dalam Shigeru)
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# 2. Izinkan ping (ICMP echo-request) dari subnet Switch-Terminal (192.213.4.56/29)
+iptables -A FORWARD -i eth0 -s 192.213.4.56/29 -p icmp --icmp-type echo-request -j ACCEPT
+
+# 3. Tolak seluruh trafik baru lainnya yang masuk dari arah luar (eth0 / Gendou)
+iptables -A FORWARD -i eth0 -j DROP
+```
+
+#### Verifikasi
+
+- **Ping dari Magi-Casper (`192.213.4.58`, Switch-Terminal) ke Zeruel (`192.213.4.82`):** berhasil (`0% packet loss`).
+- **Ping dari Lilith (`192.213.4.74`, Switch-Dogma) ke Zeruel (`192.213.4.82`):** gagal (`100% packet loss`) karena dijatuhkan oleh rule `FORWARD -i eth0 -j DROP` di Shigeru.
+
+![Verifikasi gerbang satu arah pada chain FORWARD Shigeru](assets/s18_gerbang-shigeru.png)  
+*Gambar 18.1: Magi-Casper (Switch-Terminal) dapat melakukan ping ke Zeruel, sedangkan ping dari Lilith (Switch-Dogma) ke Zeruel diblokir oleh Shigeru.*
+
+---
+
+### Soal 19: Mengurung Pengkhianat
+
+#### Analisis Topologi dan Strategi Isolasi
+
+**Armisael** (`192.213.4.83`) adalah pengkhianat yang berada di **Switch-Monolith** (`192.213.4.80/29`) bersama **Zeruel** (`192.213.4.82`) dan gateway **Shigeru** (`192.213.4.81`). Larangan soal menyebutkan bahwa kita **tidak boleh menyentuh atau mengubah konfigurasi apa pun di dalam container Armisael**.
+
+Oleh karena itu, isolasi total terhadap Armisael dilakukan dari dua titik di sekitarnya:
+1. **Pada Router Gateway Shigeru (`192.213.4.81`):** memblokir setiap paket dari maupun menuju `192.213.4.83` pada ketiga chain filter (`INPUT`, `OUTPUT`, dan posisi paling atas `FORWARD`). Hal ini memutus komunikasi Armisael dengan gateway Shigeru, seluruh subnet NERV lainnya (seperti Lilith), dan internet luar (seperti Seele `8.8.8.8`).
+2. **Pada Tetangga Satu Switch, Zeruel (`192.213.4.82`):** karena Armisael dan Zeruel terhubung ke switch Layer-2 yang sama (**Switch-Monolith**), trafik langsung antara Armisael dan Zeruel tidak melewati router Shigeru. Agar Armisael juga tidak bisa menghubungi Zeruel, kita memasang rule `INPUT -s 192.213.4.83 -j DROP` dan `OUTPUT -d 192.213.4.83 -j DROP` di **Zeruel** (`/root/zeruel.sh`, salinan repo: [`zeruel.sh`](out/route-scripts/zeruel.sh)).
+
+Tambahan pada `/root/shigeru-route.sh` (salinan repo: [`shigeru-route.sh`](out/route-scripts/shigeru-route.sh)):
+
+```bash
+# Isolasi Armisael (192.213.4.83) di Shigeru
+iptables -I INPUT 1 -s 192.213.4.83 -j DROP
+iptables -I OUTPUT 1 -d 192.213.4.83 -j DROP
+iptables -I FORWARD 1 -s 192.213.4.83 -j DROP
+iptables -I FORWARD 2 -d 192.213.4.83 -j DROP
+```
+
+Konfigurasi pada `/root/zeruel.sh` (salinan repo: [`zeruel.sh`](out/route-scripts/zeruel.sh)):
+
+```bash
+#!/bin/sh
+iptables -F INPUT
+iptables -F OUTPUT
+iptables -A INPUT -s 192.213.4.83 -j DROP
+iptables -A OUTPUT -d 192.213.4.83 -j DROP
+```
+
+#### Verifikasi
+
+1. **Dari Armisael (`192.213.4.83`):**
+   - Ping dan koneksi `nc` ke **Seele** (`8.8.8.8:53`), **Zeruel** (`192.213.4.82:9000`), **Lilith** (`192.213.4.74:9000`), serta gateway **Shigeru** (`192.213.4.81`) **semuanya gagal** (`100% packet loss` / timeout).
+2. **Dari Zeruel (`192.213.4.82`):**
+   - Ping dan koneksi `nc` ke **Seele** (`8.8.8.8:53`) serta **Lilith** (`192.213.4.74:9000`) **tetap berhasil normal** (`0% packet loss`, `open`).
+
+![Verifikasi isolasi total Armisael tanpa mengganggu Zeruel](assets/s19_isolasi-armisael.png)  
+*Gambar 19.1: Armisael terisolasi total dari Seele, Zeruel, Lilith, dan Shigeru tanpa mengubah konfigurasi di dalam Armisael, sementara Zeruel tetap dapat berkomunikasi normal dengan Seele dan Lilith.*
+
+---
+
+### Soal 20: Uji Kebakaran
+
+#### Strategi Persistensi dan Idempotensi
+
+Seluruh aturan firewall dan routing yang telah dikonfigurasi tidak boleh hilang saat di-*flush* atau dijalankan berulang kali, serta **tidak boleh menimbulkan duplikasi baris aturan**. Untuk itu:
+1. Pada setiap skrip utama (`/root/<nama>.sh` di **Shigeru**, **Fuyutsuki**, **Tokyo3-Core**, dll.), tabel `filter` dan `nat` selalu dibersihkan terlebih dahulu (`iptables -F`, `iptables -t nat -F`) dan rute statis dipasang dengan `ip route replace` sehingga eksekusi berulang selalu menghasilkan jumlah baris yang identik (*idempotent*).
+2. Seluruh aturan `iptables` juga disimpan ke berkas standar `/root/<nama>.rules` menggunakan `iptables-save > /root/<nama>.rules`, sehingga dapat dipulihkan kapan saja secara atomik dengan `iptables-restore < /root/<nama>.rules`.
+
+Prosedur pengujian dirangkum dalam [`uji-kebakaran-soal20.sh`](out/route-scripts/uji-kebakaran-soal20.sh):
+
+```bash
+# 1. Simpan rules
+iptables-save > /root/<nama>.rules
+
+# 2. Simulasi kebakaran: kosongkan seluruh aturan filter, nat, dan rute tambahan
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+
+# 3. Pulihkan konfigurasi dua kali berturut-turut dan bandingkan jumlah baris
+sh /root/<nama>.sh
+iptables-restore < /root/<nama>.rules
+sh /root/<nama>.sh
+```
+
+#### Hasil Uji pada 3 Node Perwakilan (`Shigeru`, `Fuyutsuki`, `Tokyo3-Core`)
+
+Setelah seluruh tabel `iptables` dan rute tambahan dikosongkan lalu skrip pemulihan dijalankan **dua kali berturut-turut**, jumlah baris `iptables -S`, `iptables -t nat -S`, dan `ip route` terbukti konsisten tanpa duplikasi:
+
+| Node | Berkas Skrip & Rules | `iptables -S` (Restore #1 vs #2) | `iptables -t nat -S` (Restore #1 vs #2) | `ip route` (Restore #1 vs #2) |
+|---|---|---|---|---|
+| **Shigeru** | `/root/shigeru.sh` & `/root/shigeru.rules` | `10` baris vs `10` baris | `4` baris vs `4` baris | `5` baris vs `5` baris |
+| **Fuyutsuki** | `/root/fuyutsuki.sh` & `/root/fuyutsuki.rules` | `3` baris vs `3` baris | `5` baris vs `5` baris | `7` baris vs `7` baris |
+| **Tokyo3-Core** | `/root/tokyo3-core.sh` & `/root/tokyo3-core.rules` | `7` baris vs `7` baris | `4` baris vs `4` baris | `2` baris vs `2` baris |
+
+![Verifikasi Uji Kebakaran Soal 20 pada Shigeru, Fuyutsuki, dan Tokyo3-Core](assets/s20_uji-kebakaran.png)  
+*Gambar 20.1: Hasil simulasi flush dan pemulihan dua kali berturut-turut pada Shigeru, Fuyutsuki, dan Tokyo3-Core menunjukkan jumlah baris `iptables` dan `ip route` yang identik tanpa duplikasi.*
+
